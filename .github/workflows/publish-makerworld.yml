@@ -1,0 +1,109 @@
+name: Build and Publish MakerWorld Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_to_makerworld:
+        description: 'If true, attempt publish to MakerWorld when secrets are configured.'
+        required: false
+        default: 'true'
+  push:
+    branches:
+      - main
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    outputs:
+      zip-name: ${{ steps.create.outputs.zip-name }}
+      version: ${{ steps.create.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create ZIP package
+        id: create
+        run: |
+          set -e
+          chmod +x .github/bump-version.sh
+          version=$(sh .github/bump-version.sh)
+          zipname="supermicro-vent-${version}.zip"
+          rm -f "$zipname"
+          zip -r "$zipname" LICENSE design print VERSION
+          echo "zip-name=$zipname" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          ls -l "$zipname"
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: supermicro-vent-package
+          path: ${{ steps.create.outputs.zip-name }}
+
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: supermicro-vent-package
+          path: .
+
+      - name: Publish to MakerWorld
+        if: ${{ secrets.MAKERWORLD_API_URL && secrets.MAKERWORLD_API_TOKEN && github.event.inputs.publish_to_makerworld != 'false' }}
+        env:
+          MAKERWORLD_API_URL: ${{ secrets.MAKERWORLD_API_URL }}
+          MAKERWORLD_API_TOKEN: ${{ secrets.MAKERWORLD_API_TOKEN }}
+        run: |
+          set -e
+          zipfile=$(ls supermicro-vent-*.zip | head -n 1)
+          echo "Publishing $zipfile to MakerWorld"
+          curl -sSL -X POST "$MAKERWORLD_API_URL" \
+            -H "Authorization: Bearer $MAKERWORLD_API_TOKEN" \
+            -F "file=@$zipfile" \
+            -F "title=SuperMicro Rack Server Airflow Grates" \
+            -F "description=$(head -n 20 Readme.md | python3 -c 'import sys, urllib.parse as u; print(u.quote(sys.stdin.read()))')" \
+            -F "license=CC-BY-NC-SA-4.0" \
+            -o makerworld-response.json
+          cat makerworld-response.json
+
+      - name: Skip MakerWorld publish if secrets absent
+        if: ${{ !secrets.MAKERWORLD_API_URL || !secrets.MAKERWORLD_API_TOKEN }}
+        run: |
+          echo "MakerWorld publish skipped because MAKERWORLD_API_URL and/or MAKERWORLD_API_TOKEN secrets are not configured."
+
+  release:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: supermicro-vent-package
+          path: .
+
+      - name: Create GitHub release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: "supermicro-vent-${{ needs.package.outputs.version }}"
+          release_name: "SuperMicro Vent package ${{ needs.package.outputs.version }}"
+          body: "Auto-generated package for supermicro-vent version ${{ needs.package.outputs.version }} from ${{ github.ref }}"
+          draft: false
+          prerelease: false
+
+      - name: Upload ZIP asset to release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ${{ needs.package.outputs.zip-name }}
+          asset_name: ${{ needs.package.outputs.zip-name }}
+          asset_content_type: application/zip
